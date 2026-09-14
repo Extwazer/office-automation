@@ -9,11 +9,12 @@ import random
 import subprocess
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
+import AppKit
 import pyautogui
+import rumps
 from pynput import keyboard, mouse
 
 
@@ -130,6 +131,11 @@ class Config:
     # for mouse moves since those play out over `duration` seconds.
     self_input_grace: float = 0.3
 
+    # Max seconds a worker thread waits for the main thread to run a
+    # pyautogui_call()-queued action, so a worker can never hang forever
+    # if the main thread stops servicing the queue (e.g. mid-shutdown).
+    action_queue_timeout: float = 15.0
+
 
 CONFIG = Config()
 
@@ -230,7 +236,11 @@ def pyautogui_call(action: Callable[[], None], suppress_duration: float = CONFIG
     errors: List[Exception] = []
 
     action_queue.put((action, done, errors))
-    done.wait()
+
+    # Bounded wait: if the main thread ever stops servicing the queue
+    # (e.g. it already quit), this must not hang the caller forever.
+    if not done.wait(timeout=CONFIG.action_queue_timeout):
+        raise TimeoutError("Timed out waiting for the main thread to run a queued pyautogui call")
 
     if errors:
         raise errors[0]
@@ -558,13 +568,45 @@ class PhpStormController:
 
 
 # ============================================================
-# PhpStorm Actions
+# Chrome Controller
 # ============================================================
 
-PHPSTORM_ACTIONS: Tuple[
-    Tuple[str, Callable[[], None]],
-    ...
-] = (
+class ChromeController:
+    """
+    Safe/read-only Chrome interactions.
+    """
+
+    @staticmethod
+    def scroll() -> None:
+        scroll_randomly()
+
+    @staticmethod
+    def next_tab() -> None:
+        logger.info("Chrome: next tab")
+        pyautogui_call(lambda: pyautogui.hotkey("command", "option", "right"))
+
+    @staticmethod
+    def page_down() -> None:
+        logger.info("Chrome: page down")
+        pyautogui_call(lambda: pyautogui.press("pagedown"))
+
+    @staticmethod
+    def page_up() -> None:
+        logger.info("Chrome: page up")
+        pyautogui_call(lambda: pyautogui.press("pageup"))
+
+
+# ============================================================
+# App Profiles
+#
+# Each profile is an app name (for AppleScript activate/frontmost checks)
+# plus a weighted pool of (label, no-arg callable) actions. To automate a
+# new app: add a Controller class of static methods like the ones above,
+# list its actions below, and add an AppProfile to APP_PROFILES -- nothing
+# else needs to change.
+# ============================================================
+
+PHPSTORM_ACTIONS: Tuple[Tuple[str, Callable[[], None]], ...] = (
     ("next_tab", PhpStormController.next_tab),
     ("next_tab", PhpStormController.next_tab),
     ("previous_tab", PhpStormController.previous_tab),
@@ -578,28 +620,56 @@ PHPSTORM_ACTIONS: Tuple[
     ("focus_editor", PhpStormController.focus_editor),
 )
 
+CHROME_ACTIONS: Tuple[Tuple[str, Callable[[], None]], ...] = (
+    ("scroll", ChromeController.scroll),
+    ("scroll", ChromeController.scroll),
+    ("next_tab", ChromeController.next_tab),
+    ("page_down", ChromeController.page_down),
+    ("page_up", ChromeController.page_up),
+)
 
-def execute_phpstorm_action() -> None:
-    action_name, action = random.choice(
-        PHPSTORM_ACTIONS,
-    )
 
-    logger.info(
-        "PhpStorm action: %s",
-        action_name,
-    )
+@dataclass
+class AppProfile:
+    name: str
+    actions: Tuple[Tuple[str, Callable[[], None]], ...]
+    # Short pause right after an action, before maybe running settle_action.
+    post_action_delay: Tuple[float, float] = (0.0, 0.0)
+    # Chance (0-1) to run settle_action once post_action_delay is over.
+    settle_probability: float = 0.0
+    settle_action: Optional[Callable[[], None]] = None
 
+
+APP_PROFILES: Tuple[AppProfile, ...] = (
+    AppProfile(
+        name="PhpStorm",
+        actions=PHPSTORM_ACTIONS,
+        post_action_delay=(1.0, 2.5),
+        settle_probability=0.35,
+        settle_action=PhpStormController.focus_editor,
+    ),
+    AppProfile(
+        name="Google Chrome",
+        actions=CHROME_ACTIONS,
+    ),
+)
+
+
+# ============================================================
+# App Automation
+# ============================================================
+
+def execute_random_action(
+    label: str,
+    actions: Tuple[Tuple[str, Callable[[], None]], ...],
+) -> None:
+    action_name, action = random.choice(actions)
+    logger.info("%s action: %s", label, action_name)
     action()
 
 
-# ============================================================
-# PhpStorm Automation
-# ============================================================
-
-def automate_phpstorm() -> None:
-    if not ApplicationController.activate_and_verify(
-        "PhpStorm"
-    ):
+def automate_app(profile: AppProfile) -> None:
+    if not ApplicationController.activate_and_verify(profile.name):
         return
 
     action_count = random.randint(
@@ -607,89 +677,31 @@ def automate_phpstorm() -> None:
         CONFIG.actions_max,
     )
 
-    logger.info(
-        "PhpStorm: executing %d actions",
-        action_count,
-    )
+    logger.info("%s: executing %d actions", profile.name, action_count)
 
     for index in range(action_count):
         if stop_event.is_set() or is_user_active():
             return
 
-        if not ApplicationController.is_frontmost("PhpStorm"):
-            logger.info("PhpStorm is no longer frontmost, stopping this cycle")
+        if not ApplicationController.is_frontmost(profile.name):
+            logger.info(
+                "%s is no longer frontmost, stopping this cycle",
+                profile.name,
+            )
             return
 
-        execute_phpstorm_action()
+        execute_random_action(profile.name, profile.actions)
 
-        if not random_delay(1.0, 2.5):
-            return
-
-        if random.random() < 0.35 and ApplicationController.is_frontmost("PhpStorm"):
-            PhpStormController.focus_editor()
-
-        if index < action_count - 1:
-            if not random_delay(
-                CONFIG.action_delay_min,
-                CONFIG.action_delay_max,
-            ):
+        if profile.post_action_delay != (0.0, 0.0):
+            if not random_delay(*profile.post_action_delay):
                 return
 
-
-# ============================================================
-# Chrome Automation
-# ============================================================
-
-def automate_chrome() -> None:
-    if not ApplicationController.activate_and_verify(
-        "Google Chrome"
-    ):
-        return
-
-    action_count = random.randint(
-        CONFIG.actions_min,
-        CONFIG.actions_max,
-    )
-
-    logger.info(
-        "Chrome: executing %d actions",
-        action_count,
-    )
-
-    for index in range(action_count):
-        if stop_event.is_set() or is_user_active():
-            return
-
-        if not ApplicationController.is_frontmost("Google Chrome"):
-            logger.info("Google Chrome is no longer frontmost, stopping this cycle")
-            return
-
-        action = random.choice(
-            [
-                "scroll",
-                "scroll",
-                "tab",
-                "page_down",
-                "page_up",
-            ]
-        )
-
-        logger.info(
-            "Chrome action: %s",
-            action,
-        )
-
-        if action == "scroll":
-            scroll_randomly()
-
-        elif action == "tab":
-            pyautogui_call(lambda: pyautogui.hotkey("command", "option", "right"))
-
-        elif action == "page_down":
-            pyautogui_call(lambda: pyautogui.press("pagedown"))
-
-        elif action == "page_up":
-            pyautogui_call(lambda: pyautogui.press("pageup"))
+        if (
+            profile.settle_action is not None
+            and random.random() < profile.settle_probability
+            and ApplicationController.is_frontmost(profile.name)
+        ):
+            profile.settle_action()
 
         if index < action_count - 1:
             if not random_delay(
@@ -706,10 +718,7 @@ def automate_chrome() -> None:
 def automation_worker() -> None:
     logger.info("Automation worker started")
 
-    applications = [
-        automate_phpstorm,
-        automate_chrome,
-    ]
+    profiles = list(APP_PROFILES)
 
     while not stop_event.is_set():
         if is_user_active():
@@ -717,9 +726,9 @@ def automation_worker() -> None:
                 break
             continue
 
-        random.shuffle(applications)
+        random.shuffle(profiles)
 
-        for application in applications:
+        for profile in profiles:
             if stop_event.is_set():
                 break
 
@@ -730,7 +739,7 @@ def automation_worker() -> None:
                 break
 
             try:
-                application()
+                automate_app(profile)
             except Exception:
                 logger.exception("Automation worker error")
 
@@ -792,71 +801,99 @@ def on_scroll(x: int, y: int, dx: int, dy: int) -> None:
 
 def prompt_duration() -> Optional[float]:
     """
-    Show a small window letting the user pick how long to run.
+    Ask the user how long to run, via a native NSAlert (rumps.alert()).
+
+    A separate GUI toolkit (e.g. tkinter) must not be used here: Tk leaves
+    CFRunLoop state behind even after root.destroy(), which then crashes
+    the process with a fatal "Tcl_Panic" abort once the menu bar app's own
+    run loop (rumps/AppKit) starts afterward in the same process.
 
     Returns:
         The chosen duration in seconds, or None for "no limit".
-
-    Raises:
-        SystemExit: if the window is closed without picking an option.
     """
-    choice: dict = {}
+    # Without this, the alert can render behind whatever launched us (e.g.
+    # the Terminal window from Start Office Automation.command), making it
+    # look like nothing happened.
+    AppKit.NSApplication.sharedApplication()
+    AppKit.NSRunningApplication.currentApplication().activateWithOptions_(
+        AppKit.NSApplicationActivateIgnoringOtherApps
+    )
 
-    root = tk.Tk()
-    root.title("Office Automation")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
+    # NSAlert's three buttons map to fixed return codes: ok -> 1,
+    # cancel -> 0, other -> -1. There's no fourth way to dismiss it (no
+    # close box on a modal alert), so every branch is covered.
+    result = rumps.alert(
+        title="Office Automation",
+        message="На сколько запустить?",
+        ok="1 час",
+        cancel="2 часа",
+        other="Без ограничений",
+    )
 
-    def pick(seconds: Optional[float]) -> None:
-        choice["seconds"] = seconds
-        root.destroy()
+    if result == 1:
+        return 3600.0
+    elif result == 0:
+        return 7200.0
+    else:
+        return None
 
-    tk.Label(
-        root,
-        text="На сколько запустить?",
-        font=("Helvetica", 13),
-    ).pack(padx=24, pady=(20, 12))
 
-    button_frame = tk.Frame(root)
-    button_frame.pack(padx=24, pady=(0, 20))
+# ============================================================
+# Menu Bar App
+# ============================================================
 
-    tk.Button(
-        button_frame,
-        text="1 час",
-        width=12,
-        command=lambda: pick(3600.0),
-    ).grid(row=0, column=0, padx=5, pady=5)
+class OfficeAutomationApp(rumps.App):
+    """
+    Minimal menu bar front-end. Shows a running/paused icon plus a status
+    line, and its built-in Quit item (relabeled "Stop") is the click-to-stop
+    control -- ESC keeps working too, from anywhere, via the global
+    keyboard listener.
+    """
 
-    tk.Button(
-        button_frame,
-        text="2 часа",
-        width=12,
-        command=lambda: pick(7200.0),
-    ).grid(row=0, column=1, padx=5, pady=5)
+    def __init__(self, run_duration: Optional[float]) -> None:
+        super().__init__("▶️", quit_button="Stop")
 
-    tk.Button(
-        button_frame,
-        text="Без ограничений",
-        width=27,
-        command=lambda: pick(None),
-    ).grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        self.run_duration = run_duration
+        self.start_time = time.monotonic()
 
-    root.update_idletasks()
+        self.status_item = rumps.MenuItem("Status: running")
+        self.menu = [self.status_item]
 
-    width = root.winfo_reqwidth()
-    height = root.winfo_reqheight()
-    x = (root.winfo_screenwidth() - width) // 2
-    y = (root.winfo_screenheight() - height) // 3
+    @rumps.timer(0.1)
+    def _tick(self, _sender: object) -> None:
+        if stop_event.is_set():
+            rumps.quit_application()
+            return
 
-    root.geometry(f"{width}x{height}+{x}+{y}")
+        if (
+            self.run_duration is not None
+            and time.monotonic() - self.start_time >= self.run_duration
+        ):
+            logger.info("Run duration elapsed, stopping")
+            stop_event.set()
+            rumps.quit_application()
+            return
 
-    root.mainloop()
+        # Actually run any pyautogui call queued by pyautogui_call(), right
+        # here on the main thread (see action_queue's comment above it).
+        try:
+            action, action_done, action_errors = action_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            try:
+                action()
+            except Exception as exc:
+                action_errors.append(exc)
+            finally:
+                action_done.set()
 
-    if "seconds" not in choice:
-        logger.info("Startup dialog closed without a choice, exiting")
-        raise SystemExit(0)
-
-    return choice["seconds"]
+        if is_user_active():
+            self.title = "⏸"
+            self.status_item.title = "Status: paused (user is active)"
+        else:
+            self.title = "▶️"
+            self.status_item.title = "Status: running"
 
 
 # ============================================================
@@ -873,7 +910,7 @@ def main() -> None:
     else:
         logger.info("Run duration: %.0f minutes", run_duration / 60)
 
-    logger.info("Press ESC to stop")
+    logger.info("Press ESC, or Stop in the menu bar, to stop")
 
     pyautogui.FAILSAFE = True
 
@@ -903,47 +940,18 @@ def main() -> None:
         on_scroll=on_scroll,
     )
 
-    try:
-        start_caffeinate()
+    shutdown_done = threading.Event()
 
-        mouse_thread.start()
-        automation_thread.start()
-        keyboard_listener.start()
-        mouse_listener.start()
+    def shutdown() -> None:
+        if shutdown_done.is_set():
+            return
+        shutdown_done.set()
 
-        start_time = time.monotonic()
-
-        while not stop_event.is_set():
-            if (
-                run_duration is not None
-                and time.monotonic() - start_time >= run_duration
-            ):
-                logger.info("Run duration elapsed, stopping")
-                break
-
-            # Actually run any pyautogui call queued by pyautogui_call(),
-            # right here on the main thread (see action_queue's comment).
-            try:
-                action, action_done, action_errors = action_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            try:
-                action()
-            except Exception as exc:
-                action_errors.append(exc)
-            finally:
-                action_done.set()
-
-    except KeyboardInterrupt:
-        logger.info("Ctrl+C pressed")
-
-    finally:
         stop_event.set()
 
         # Safety net: if shutdown below somehow hangs (e.g. a stuck
         # subprocess or a wedged thread), force the process to exit anyway
-        # after a few seconds rather than leaving ESC/Ctrl+C looking like
+        # after a few seconds rather than leaving ESC/Stop looking like
         # they did nothing -- and leaving caffeinate running forever.
         def _force_exit() -> None:
             logger.warning("Shutdown taking too long, forcing exit")
@@ -972,6 +980,32 @@ def main() -> None:
         watchdog.cancel()
 
         logger.info("Program stopped")
+
+    # rumps.quit_application() (called by our own timer, or by clicking the
+    # built-in "Stop" item) tears down the Cocoa app in a way that can skip
+    # right past a wrapping Python try/finally -- so cleanup is hooked here,
+    # into rumps' own pre-quit event, rather than relied on to run after
+    # app.run() returns. shutdown() is idempotent, so the try/finally below
+    # is just a defensive fallback for any other, unexpected exit path.
+    @rumps.events.before_quit
+    def _on_before_quit() -> None:
+        shutdown()
+
+    try:
+        start_caffeinate()
+
+        mouse_thread.start()
+        automation_thread.start()
+        keyboard_listener.start()
+        mouse_listener.start()
+
+        OfficeAutomationApp(run_duration).run()
+
+    except KeyboardInterrupt:
+        logger.info("Ctrl+C pressed")
+
+    finally:
+        shutdown()
 
 
 if __name__ == "__main__":
