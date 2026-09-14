@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# JetBrains project files
+.idea/
+
+# macOS
+.DS_Store
+
+# Runtime logs
+office.log
+office.log.*
+launch.log
