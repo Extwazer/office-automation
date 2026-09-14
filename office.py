@@ -97,6 +97,13 @@ class Config:
     app_activation_retries: int = 3
     app_activation_delay: float = 1.5
 
+    # Max seconds to wait for a single osascript call (activating an app,
+    # or asking which one is frontmost) before giving up on it. Without
+    # this, a stuck osascript/System Events call (e.g. behind an
+    # unanswered permission prompt) would hang the automation thread
+    # forever, since is_frontmost() is now checked before every action.
+    osascript_timeout: float = 5.0
+
     # Scrolling
     scroll_min: int = 3
     scroll_max: int = 8
@@ -286,12 +293,16 @@ class ApplicationController:
         end tell
         '''
 
-        subprocess.run(
-            ["osascript", "-e", script],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.run(
+                ["osascript", "-e", script],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=CONFIG.osascript_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Timed out activating %s", app_name)
 
     @staticmethod
     def get_frontmost_app() -> Optional[str]:
@@ -301,16 +312,26 @@ class ApplicationController:
         end tell
         '''
 
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=CONFIG.osascript_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Timed out asking for the frontmost application")
+            return None
 
         app_name = result.stdout.strip()
 
         return app_name if app_name else None
+
+    @classmethod
+    def is_frontmost(cls, app_name: str) -> bool:
+        frontmost = cls.get_frontmost_app()
+        return frontmost is not None and frontmost.lower() == app_name.lower()
 
     @classmethod
     def activate_and_verify(cls, app_name: str) -> bool:
@@ -595,12 +616,16 @@ def automate_phpstorm() -> None:
         if stop_event.is_set() or is_user_active():
             return
 
+        if not ApplicationController.is_frontmost("PhpStorm"):
+            logger.info("PhpStorm is no longer frontmost, stopping this cycle")
+            return
+
         execute_phpstorm_action()
 
         if not random_delay(1.0, 2.5):
             return
 
-        if random.random() < 0.35:
+        if random.random() < 0.35 and ApplicationController.is_frontmost("PhpStorm"):
             PhpStormController.focus_editor()
 
         if index < action_count - 1:
@@ -633,6 +658,10 @@ def automate_chrome() -> None:
 
     for index in range(action_count):
         if stop_event.is_set() or is_user_active():
+            return
+
+        if not ApplicationController.is_frontmost("Google Chrome"):
+            logger.info("Google Chrome is no longer frontmost, stopping this cycle")
             return
 
         action = random.choice(
@@ -912,6 +941,19 @@ def main() -> None:
     finally:
         stop_event.set()
 
+        # Safety net: if shutdown below somehow hangs (e.g. a stuck
+        # subprocess or a wedged thread), force the process to exit anyway
+        # after a few seconds rather than leaving ESC/Ctrl+C looking like
+        # they did nothing -- and leaving caffeinate running forever.
+        def _force_exit() -> None:
+            logger.warning("Shutdown taking too long, forcing exit")
+            stop_caffeinate()
+            os._exit(1)
+
+        watchdog = threading.Timer(10.0, _force_exit)
+        watchdog.daemon = True
+        watchdog.start()
+
         try:
             keyboard_listener.stop()
         except Exception:
@@ -927,6 +969,7 @@ def main() -> None:
                 thread.join(timeout=2)
 
         stop_caffeinate()
+        watchdog.cancel()
 
         logger.info("Program stopped")
 
