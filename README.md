@@ -22,7 +22,7 @@
 ## Установка
 
 ```bash
-git clone <URL-этого-репозитория>
+git clone https://github.com/Extwazer/office-automation
 cd office
 python3 -m venv .venv
 source .venv/bin/activate
@@ -59,7 +59,12 @@ Events/PhpStorm/Google Chrome через AppleScript (Automation) — это о�
 Два равнозначных способа:
 
 - **Двойной клик по [`Start Office Automation.command`](Start%20Office%20Automation.command)**
-  — откроется Terminal и запустит скрипт через `.venv` проекта.
+  — откроется Terminal (сворачивается сама через мгновение) и запустит скрипт
+  через `.venv` проекта. Файл сам применяет себе иконку из
+  `assets/launcher_icon.icns` при каждом запуске ([`scripts/set_launcher_icon.py`](scripts/set_launcher_icon.py))
+  — кастомные иконки Finder хранятся в метаданных файловой системы, которые
+  git не отслеживает, так что без этого иконка терялась бы при клонировании
+  на другой Mac.
 - **Из терминала:**
   ```bash
   source .venv/bin/activate

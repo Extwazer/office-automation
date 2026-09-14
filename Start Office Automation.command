@@ -10,6 +10,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 cd "$DIR"
 
+# Re-apply this file's custom Finder icon (assets/launcher_icon.icns) on
+# every launch -- see scripts/set_launcher_icon.py for why.
+"$DIR/.venv/bin/python3" "$DIR/scripts/set_launcher_icon.py" >/dev/null 2>&1 &
+
 # Once running, the app lives in the menu bar (see office.py's
 # OfficeAutomationApp) -- this Terminal window is just how it got launched,
 # so minimize it almost immediately instead of leaving it on screen. (Not
