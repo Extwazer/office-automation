@@ -129,7 +129,13 @@ class Config:
     # to keep ignoring listener callbacks, so our own synthetic
     # events aren't mistaken for real user activity. Kept generous
     # for mouse moves since those play out over `duration` seconds.
-    self_input_grace: float = 0.3
+    #
+    # Also needs real headroom for plain key presses like ESC: the gap
+    # between posting the event and the listener actually seeing it can
+    # spike well past what you'd expect under load -- observed 805ms in
+    # practice, once, which is what made PhpStormController.focus_editor()
+    # get mistaken for a real ESC press and stop the whole script.
+    self_input_grace: float = 1.5
 
     # Max seconds a worker thread waits for the main thread to run a
     # pyautogui_call()-queued action, so a worker can never hang forever
@@ -560,7 +566,14 @@ class PhpStormController:
     @staticmethod
     def focus_editor() -> None:
         logger.info("PhpStorm: focus editor")
-        pyautogui_call(lambda: pyautogui.press("esc"))
+        # Extra margin on top of CONFIG.self_input_grace: this is the one
+        # key press that, misread as real, stops the whole script (ESC is
+        # the stop hotkey) -- worth extra headroom against dispatch-delay
+        # spikes specifically here.
+        pyautogui_call(
+            lambda: pyautogui.press("esc"),
+            suppress_duration=CONFIG.self_input_grace + 1.5,
+        )
 
     @staticmethod
     def scroll() -> None:
@@ -859,6 +872,15 @@ class OfficeAutomationApp(rumps.App):
         self.status_item = rumps.MenuItem("Status: running")
         self.menu = [self.status_item]
 
+        # Without this, macOS's "Automatic Termination" can silently kill
+        # an idle-looking background/menu-bar app like this one (no
+        # visible windows) -- which looked, from the logs, exactly like
+        # an unexplained stop: no ESC, no duration-elapsed, cleanup still
+        # ran (via before_quit) but nothing said why it started.
+        AppKit.NSProcessInfo.processInfo().disableAutomaticTermination_(
+            "Office automation is running in the background"
+        )
+
     @rumps.timer(0.1)
     def _tick(self, _sender: object) -> None:
         if stop_event.is_set():
@@ -989,7 +1011,22 @@ def main() -> None:
     # is just a defensive fallback for any other, unexpected exit path.
     @rumps.events.before_quit
     def _on_before_quit() -> None:
+        # Logged unconditionally, before anything else: on_press/_tick log
+        # *why* they stop (ESC / duration elapsed) before setting
+        # stop_event, but this fires for every other way the app quits too
+        # (clicking Stop, or macOS asking the app to terminate) -- and
+        # those had no log line at all until now, making past stops with
+        # no visible cause impossible to tell apart after the fact.
+        logger.info("Quit requested (Stop clicked, or macOS asked the app to quit)")
         shutdown()
+
+    @rumps.events.on_sleep
+    def _on_sleep() -> None:
+        logger.info("System is going to sleep")
+
+    @rumps.events.on_wake
+    def _on_wake() -> None:
+        logger.info("System woke up")
 
     try:
         start_caffeinate()
